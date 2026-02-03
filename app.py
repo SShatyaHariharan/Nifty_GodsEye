@@ -14,10 +14,10 @@ def read_file(path):
         return f.read().strip()
 
 # ================= CONFIG =================
-API_KEY = read_file("api_key.txt")
-API_SECRET = read_file("api_secret.txt")
-ACCESS_TOKEN = read_file("access_token.txt")
-TOKEN_FILE = "access_token.txt"
+API_KEY = read_file("config/api_key.txt")
+API_SECRET = read_file("config/api_secret.txt")
+ACCESS_TOKEN = read_file("config/access_token.txt")
+TOKEN_FILE = "config/access_token.txt"
 
 LOT_SIZE = 1
 SL_PCT = 0.30
@@ -44,7 +44,7 @@ SCOPES = [
 ]
 
 creds = Credentials.from_service_account_file(
-    "google_creds.json", scopes=SCOPES
+    "config/google_creds.json", scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
