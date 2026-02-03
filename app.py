@@ -309,4 +309,4 @@ def status():
 # ================= MAIN =================
 if __name__ == "__main__":
     print("🚀 Kite Paper Trading Engine Started")
-    app.run(host="0.0.0.0", port=80)
+    app.run(host="0.0.0.0", port=5000)
