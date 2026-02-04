@@ -69,6 +69,24 @@ print("✅ Instruments loaded")
 # ================= GOOGLE SHEET LOGGER =================
 from datetime import datetime
 
+def get_option_margin(symbol, price,lot_size):
+    try:
+        margin = kite.order_margins([{
+            "exchange": "NFO",
+            "tradingsymbol": symbol,
+            "transaction_type": "BUY",
+            "variety": "regular",
+            "product": "MIS",
+            "order_type": "MARKET",
+            "quantity": lot_size,
+            "price": price
+        }])
+
+        return margin[0]["total"]  # total margin required
+    except Exception as e:
+        print("⚠️ Margin fetch failed:", e)
+        return None
+
 def log_entry(row):
     sheet.append_row([
         row["entry_time"],
@@ -77,9 +95,11 @@ def log_entry(row):
         row["strike"],
         row["option"],
         row["entry_price"],
-        0,
+        round(row["margin"], 2),
         row["symbol"],
-        ""
+        "",                     # Reason
+        0,                      # PnL ₹ (ENTRY)
+        0                       # PnL %
     ], value_input_option="USER_ENTERED")
 
 # def log_exit(row_idx, exit_price, pnl, reason):
@@ -90,7 +110,7 @@ def log_entry(row):
 #     sheet.update(f"J{row_idx}", round(pnl, 2))
 #     sheet.update(f"K{row_idx}", reason)
 
-def log_exit(position, exit_price, pnl, reason):
+def log_exit(position, exit_price, pnl, pnl_pct, reason):
     sheet.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "EXIT",
@@ -98,9 +118,11 @@ def log_exit(position, exit_price, pnl, reason):
         position["strike"],
         position["option"],
         exit_price,
-        pnl,
+        round(position["margin"], 2),
         position["symbol"],
-        reason
+        reason,
+        round(pnl, 2),
+        round(pnl_pct, 2)
     ], value_input_option="USER_ENTERED")
 
 # ================= WEBSOCKET =================
@@ -154,20 +176,26 @@ def get_nearest_option(nifty_ltp, option_type):
         "token": int(opt["instrument_token"]),
         "symbol": opt["tradingsymbol"],
         "strike": atm,
-        "option": option_type
+        "option": option_type,
+        "lot_size": int(opt["lot_size"])
     }
 
 # ================= EXIT HANDLER =================
 def exit_trade(reason, exit_price):
     global open_position
 
-    pnl = (exit_price - open_position["entry_price"]) * LOT_SIZE
+    price_diff = exit_price - open_position["entry_price"]
+    pnl = price_diff * LOT_SIZE
+
+    pnl_pct = (pnl / open_position["margin"]) * 100
 
     log_exit(
     open_position,
     exit_price,
     pnl,
-    reason)
+    pnl_pct,
+    reason
+    )
 
     print(f"🔴 EXIT {reason} | PnL: {pnl}")
     open_position = None
@@ -270,6 +298,15 @@ def webhook():
 
         if not entry_price:
             return jsonify({"error": "Option LTP not ready"})
+        
+        margin_price = get_option_margin(
+            opt["symbol"],
+            entry_price,
+            opt["lot_size"]
+        )
+
+        if not margin_price:
+            return jsonify({"error": "Margin not available"})
 
         sheet_row = log_entry({
             "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -277,7 +314,8 @@ def webhook():
             "strike": opt["strike"],
             "option": opt["option"],
             "symbol": opt["symbol"],
-            "entry_price": round(entry_price, 2)
+            "entry_price": round(entry_price, 2),
+            "margin": margin_price
         })
 
         open_position = {
@@ -287,10 +325,11 @@ def webhook():
             "strike": opt["strike"],
             "option": opt["option"],
             "entry_price": entry_price,
+            "lot_size": opt["lot_size"],
+            "margin": margin_price,
             "sl": entry_price * (1 - SL_PCT),
             "target": entry_price * (1 + TARGET_PCT),
-            "exit_time": datetime.now() + timedelta(minutes=MAX_TRADE_DURATION_MIN),
-            "sheet_row": sheet_row
+            "exit_time": datetime.now() + timedelta(minutes=MAX_TRADE_DURATION_MIN)
         }
 
         last_signal = signal
