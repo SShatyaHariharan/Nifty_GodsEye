@@ -5,7 +5,6 @@ import pandas as pd
 import threading
 import time
 import json
-import queue
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -61,7 +60,6 @@ ltp_cache = {}
 open_position = None
 last_signal = None
 lock = threading.Lock()
-token_ready_events = {}  # Track which tokens have received first tick
 
 # ================= DYNAMIC KITE MANAGER =================
 class KiteManager:
@@ -72,32 +70,23 @@ class KiteManager:
         self.kite = None
         self.kws = None
         self.ws_connected = False
-        self.ws_connecting = False
         self.pending_subscriptions = set()
         self.lock = threading.Lock()
-        self.tick_queue = queue.Queue()
         self.initialize()
     
     def initialize(self):
         """Initialize or reinitialize Kite connections"""
         with self.lock:
-            if self.ws_connecting:
-                # print("⏳ WebSocket connection already in progress...")
-                return False
-                
-            self.ws_connecting = True
-            
             # Close existing WebSocket if any
             if self.kws:
                 try:
                     self.kws.close()
-                    time.sleep(1)
+                    time.sleep(1)  # Give time to close gracefully
                 except:
                     pass
             
             if not self.access_token:
-                # print("⚠️ No access token available. Please generate one via /accesstoken")
-                self.ws_connecting = False
+                print("⚠️ No access token available. Please generate one via /accesstoken")
                 return False
             
             try:
@@ -107,7 +96,7 @@ class KiteManager:
                 
                 # Test the token validity
                 profile = self.kite.profile()
-                # print(f"✅ Kite Connected: {profile.get('user_name', 'Unknown')}")
+                print(f"✅ Kite Connected: {profile.get('user_name', 'Unknown')}")
                 
                 # Initialize WebSocket
                 self.kws = KiteTicker(self.api_key, self.access_token)
@@ -124,10 +113,9 @@ class KiteManager:
                 return True
                 
             except Exception as e:
-                # print(f"❌ Failed to initialize Kite: {e}")
+                print(f"❌ Failed to initialize Kite: {e}")
                 self.kite = None
                 self.kws = None
-                self.ws_connecting = False
                 return False
     
     def update_access_token(self, new_token):
@@ -136,101 +124,57 @@ class KiteManager:
         write_file(ACCESS_TOKEN_FILE, new_token)
         success = self.initialize()
         if success:
-            # Wait for connection before resubscribing
-            wait_count = 0
-            while not self.ws_connected and wait_count < 30:
-                time.sleep(0.5)
-                wait_count += 1
-            
-            if self.ws_connected:
-                # Resubscribe to instruments if position is open
-                global open_position
-                if open_position:
-                    self.subscribe(open_position["token"])
-                # Always subscribe to NIFTY
-                self.subscribe(NIFTY_TOKEN)
+            # Resubscribe to instruments if position is open
+            global open_position
+            if open_position:
+                self.subscribe(open_position["token"])
+            # Always subscribe to NIFTY
+            self.subscribe(NIFTY_TOKEN)
         return success
     
     def on_ticks(self, ws, ticks):
         for t in ticks:
-            token = t["instrument_token"]
-            ltp_cache[token] = t["last_price"]
-            # Signal that we've received data for this token
-            if token in token_ready_events:
-                token_ready_events[token].set()
+            ltp_cache[t["instrument_token"]] = t["last_price"]
     
     def on_connect(self, ws, response):
         self.ws_connected = True
-        self.ws_connecting = False
-        # print("🟢 WebSocket Connected")
-        
-        # Small delay to ensure connection is fully ready
-        time.sleep(0.5)
-        
+        print("🟢 WebSocket Connected")
         ws.subscribe([NIFTY_TOKEN])
         ws.set_mode(ws.MODE_LTP, [NIFTY_TOKEN])
         
         # Handle pending subscriptions
         if self.pending_subscriptions:
-            time.sleep(0.2)  # Brief pause before batch subscribe
             ws.subscribe(list(self.pending_subscriptions))
             ws.set_mode(ws.MODE_LTP, list(self.pending_subscriptions))
             self.pending_subscriptions.clear()
     
     def on_close(self, ws, code, reason):
         self.ws_connected = False
-        self.ws_connecting = False
-        # print(f"🔴 WebSocket Closed: {code} - {reason}")
+        print(f"🔴 WebSocket Closed: {reason}")
     
     def on_error(self, ws, code, reason):
         print(f"⚠️ WebSocket Error: {code} - {reason}")
     
     def on_reconnect(self, ws, attempt_count):
-        # print(f"🔄 WebSocket Reconnecting... Attempt {attempt_count}")
-        self.ws_connecting = True
+        print(f"🔄 WebSocket Reconnecting... Attempt {attempt_count}")
     
     def on_noreconnect(self, ws):
-        # print("❌ WebSocket Max Reconnects Reached")
+        print("❌ WebSocket Max Reconnects Reached")
         self.ws_connected = False
-        self.ws_connecting = False
     
     def subscribe(self, token):
-        """Thread-safe subscribe with readiness tracking"""
+        """Thread-safe subscribe"""
         if not token:
-            return False
+            return
         
-        # Create event for this token if not exists
-        if token not in token_ready_events:
-            token_ready_events[token] = threading.Event()
-        
-        if self.ws_connected and self.kws:
+        if self.ws_connected and self.kws and self.kws.ws:
             try:
                 self.kws.subscribe([token])
                 self.kws.set_mode(self.kws.MODE_LTP, [token])
-                return True
             except Exception as e:
-                # print(f"Subscribe error: {e}")
-                self.pending_subscriptions.add(token)
-                return False
+                print(f"Subscribe error: {e}")
         else:
             self.pending_subscriptions.add(token)
-            return False
-    
-    def wait_for_ltp(self, token, timeout=10):
-        """Wait for LTP to be available for a specific token"""
-        if token in ltp_cache:
-            return ltp_cache[token]
-        
-        if token not in token_ready_events:
-            token_ready_events[token] = threading.Event()
-        
-        # Try to subscribe if not already
-        self.subscribe(token)
-        
-        # Wait for first tick
-        if token_ready_events[token].wait(timeout=timeout):
-            return ltp_cache.get(token)
-        return None
     
     def get_kite(self):
         """Get current kite instance"""
@@ -256,18 +200,18 @@ def load_instruments():
     while True:
         try:
             if not kite_manager.is_ready():
-                # print("⏳ Waiting for Kite connection to load instruments...")
+                print("⏳ Waiting for Kite connection to load instruments...")
                 time.sleep(5)
                 continue
                 
-            # print("📥 Loading instruments...")
+            print("📥 Loading instruments...")
             instruments = pd.DataFrame(kite_manager.get_kite().instruments("NFO"))
             instruments = instruments[instruments["name"] == "NIFTY"]
             instruments["expiry"] = pd.to_datetime(instruments["expiry"])
             print("✅ Instruments loaded")
             break
         except Exception as e:
-            # print(f"⚠️ Failed to load instruments: {e}. Retrying in 5s...")
+            print(f"⚠️ Failed to load instruments: {e}. Retrying in 5s...")
             time.sleep(5)
 
 # Start instrument loading in background
@@ -324,6 +268,10 @@ def log_exit(row_idx, position, exit_price, exit_margin, pnl, pnl_pct, reason):
     sheet.update_cell(row_idx, 11, round(pnl_pct, 2))     # K: P/L %
     sheet.update_cell(row_idx, 13, reason)                # M: Exit Reason
 
+# ================= SAFE SUBSCRIBE =================
+def safe_subscribe(token):
+    kite_manager.subscribe(token)
+
 # ================= OPTION SELECTION =================
 def get_nearest_option(nifty_ltp, option_type):
     atm = round(nifty_ltp / 50) * 50
@@ -372,11 +320,6 @@ def exit_trade(reason, exit_price):
     )
 
     print(f"🔴 EXIT {reason} | {open_position['symbol']} | PnL: ₹{pnl:.2f} ({pnl_pct:.2f}%)")
-    
-    # Cleanup token event
-    if open_position["token"] in token_ready_events:
-        del token_ready_events[open_position["token"]]
-    
     open_position = None
 
 # ================= MONITOR THREAD =================
@@ -426,7 +369,6 @@ def generate_access_token():
         <body>
             <h2>Kite Access Token Manager</h2>
             <p><b>Status:</b> {status}</p>
-            <p><b>WebSocket:</b> {'Connected' if kite_manager.ws_connected else 'Disconnected'}</p>
             <p><b>Current Token:</b> {'*' * 10}{current_token[-5:] if current_token else 'None'}</p>
             <hr>
             <h3>Generate New Token</h3>
@@ -530,10 +472,6 @@ def webhook():
     if not kite_manager.is_ready():
         return jsonify({"error": "Kite not connected. Please generate access token."}), 503
 
-    # Check WebSocket is actually connected
-    if not kite_manager.ws_connected:
-        return jsonify({"error": "WebSocket not connected. Please wait and retry."}), 503
-
     signal = request.json.get("signal")
     if signal not in ["BUY_CALL", "BUY_PUT"]:
         return jsonify({"error": "Invalid signal"}), 400
@@ -554,19 +492,17 @@ def webhook():
 
         option_type = "CE" if signal == "BUY_CALL" else "PE"
         opt = get_nearest_option(nifty_ltp, option_type)
-        
-        # Subscribe and wait for LTP with proper timeout
-        print(f"⏳ Subscribing to {opt['symbol']} (token: {opt['token']})...")
-        entry_price = kite_manager.wait_for_ltp(opt["token"], timeout=15)
-        
+        safe_subscribe(opt["token"])
+
+        entry_price = None
+        for _ in range(30):
+            entry_price = ltp_cache.get(opt["token"])
+            if entry_price:
+                break
+            time.sleep(0.1)
+
         if not entry_price:
-            return jsonify({
-                "error": "Option LTP not ready", 
-                "symbol": opt["symbol"],
-                "token": opt["token"],
-                "ws_connected": kite_manager.ws_connected,
-                "cache_keys": list(ltp_cache.keys())
-            }), 503
+            return jsonify({"error": "Option LTP not ready"}), 503
         
         margin_price = get_option_margin(
             opt["symbol"],
@@ -612,13 +548,10 @@ def status():
     return jsonify({
         "kite_connected": kite_manager.is_ready(),
         "websocket_connected": kite_manager.ws_connected,
-        "websocket_connecting": kite_manager.ws_connecting,
         "nifty_ltp": ltp_cache.get(NIFTY_TOKEN),
         "open_trade": bool(open_position),
         "position": open_position if open_position else None,
-        "instruments_loaded": instruments is not None,
-        "ltp_cache_size": len(ltp_cache),
-        "subscribed_tokens": list(ltp_cache.keys())
+        "instruments_loaded": instruments is not None
     })
 
 @app.route("/health")
